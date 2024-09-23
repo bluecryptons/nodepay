@@ -1,3 +1,24 @@
-"scripts": {
-  "start": "node index.js"
+{
+  "name": "nodepay-proxy-automation",
+  "version": "1.0.0",
+  "description": "A Node.js script to automate proxy-based API calls for NodePay with WebSocket and ping functionality",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "proxy",
+    "websocket",
+    "ping",
+    "nodepay",
+    "api"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "https-proxy-agent": "^5.0.0",
+    "log4js": "^6.3.0",
+    "node-fetch": "^2.6.7",
+    "uuid": "^8.3.2"
+  }
 }
