@@ -1,142 +1,220 @@
-const WebSocket = require('ws');
-const axios = require('axios');
-const fs = require('fs');
-const dotenv = require('dotenv');
-const { v4: uuidv4 } = require('uuid');
-const log = require('loglevel');
+import fetch from 'node-fetch';
+import { v4 as uuidv4 } from 'uuid';
+import log4js from 'log4js';
 
-dotenv.config();
+const logger = log4js.getLogger();
+logger.level = 'info';  // Set log level to 'info' to see progress
 
-const WEBSOCKET_URL = "wss://nw.nodepay.ai:4576/websocket";
-const SERVER_HOSTNAME = "nw.nodepay.ai";
-const RETRY_INTERVAL = 60000; // in milliseconds
-const PING_INTERVAL = 10000; // in milliseconds
-const NP_TOKEN = process.env.NP_TOKEN;
+// Constants
+const NP_TOKEN = "WRITE_YOUR_NP_TOKEN_HERE";
+const PING_INTERVAL = 30000; // 30 seconds
+const RETRIES_LIMIT = 60; // Global retry counter for ping failures
 
-async function getUserId() {
+const DOMAIN_API = {
+  SESSION: "https://api.nodepay.ai/api/auth/session",
+  PING: "https://nw2.nodepay.ai/api/network/ping"
+};
+
+const CONNECTION_STATES = {
+  CONNECTED: 1,
+  DISCONNECTED: 2,
+  NONE_CONNECTION: 3
+};
+
+let statusConnect = CONNECTION_STATES.NONE_CONNECTION;
+let tokenInfo = NP_TOKEN;
+let browserId = null;
+let accountInfo = {};
+
+function validResp(resp) {
+  if (!resp || !resp.code || resp.code < 0) {
+    throw new Error("Invalid response");
+  }
+  return resp;
+}
+
+async function renderProfileInfo(proxy) {
+  logger.info(`Fetching profile info for proxy: ${proxy}`);
+  
   try {
-    const response = await axios.get('https://api.nodepay.ai/api/network/device-networks?page=0&size=10&active=false', {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${NP_TOKEN}`,
-      },
-    });
-    return response.data.data[0].user_id;
+    const npSessionInfo = loadSessionInfo(proxy);
+
+    if (!npSessionInfo) {
+      const response = await callApi(DOMAIN_API.SESSION, {}, proxy);
+      validResp(response);
+      accountInfo = response.data;
+      logger.info(`Received session info: ${JSON.stringify(accountInfo)}`);
+      
+      if (accountInfo.uid) {
+        saveSessionInfo(proxy, accountInfo);
+        await startPing(proxy);
+      } else {
+        handleLogout(proxy);
+      }
+    } else {
+      accountInfo = npSessionInfo;
+      logger.info(`Loaded session info from cache: ${JSON.stringify(accountInfo)}`);
+      await startPing(proxy);
+    }
   } catch (error) {
-    log.error('Error fetching user ID:', error);
+    logger.error(`Error in renderProfileInfo for proxy ${proxy}: ${error.message}`);
+    if (error.message.includes("500 Internal Server Error")) {
+      logger.info(`Removing error proxy from the list: ${proxy}`);
+      removeProxyFromList(proxy);
+      return null;
+    } else {
+      logger.error(`Connection error: ${error.message}`);
+      return proxy;
+    }
+  }
+}
+
+async function callApi(url, data, proxy) {
+  logger.info(`Calling API: ${url} with data: ${JSON.stringify(data)} via proxy: ${proxy}`);
+  
+  const headers = {
+    "Authorization": `Bearer ${tokenInfo}`,
+    "Content-Type": "application/json"
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(data),
+      agent: proxy ? new HttpsProxyAgent(proxy) : null
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed API call to ${url}`);
+    }
+
+    const jsonResponse = await response.json();
+    logger.info(`API response: ${JSON.stringify(jsonResponse)}`);
+    return validResp(jsonResponse);
+  } catch (error) {
+    logger.error(`Error during API call: ${error.message}`);
     throw error;
   }
 }
 
-async function callApiInfo(token) {
-  return {
-    code: 0,
-    data: {
-      uid: await getUserId(),
-    },
-  };
-}
-
-async function connectSocketProxy(httpProxy, token, reconnectInterval = RETRY_INTERVAL, pingInterval = PING_INTERVAL) {
-  const browserId = uuidv4();
-  log.info(`Browser ID: ${browserId}`);
-
-  let retries = 0;
-
-  while (true) {
-    try {
-      log.info(`Connecting to WebSocket via proxy: ${httpProxy}`);
-      const ws = new WebSocket(WEBSOCKET_URL, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-        },
-        rejectUnauthorized: false,
-      });
-
-      ws.on('open', () => {
-        log.info('Connected to WebSocket');
-        retries = 0;
-      });
-
-      ws.on('message', async (message) => {
-        const data = JSON.parse(message);
-        if (data.action === 'PONG') {
-          await sendPong(ws, data.id);
-          setTimeout(() => sendPing(ws, data.id), pingInterval);
-        } else if (data.action === 'AUTH') {
-          const apiResponse = await callApiInfo(token);
-          if (apiResponse.code === 0 && apiResponse.data.uid) {
-            const authInfo = {
-              user_id: apiResponse.data.uid,
-              browser_id: browserId,
-              user_agent: 'Mozilla/5.0',
-              timestamp: Math.floor(Date.now() / 1000),
-              device_type: 'extension',
-              version: 'extension_version',
-              token: token,
-              origin_action: 'AUTH',
-            };
-            await sendPing(ws, data.id, authInfo);
-          } else {
-            log.error('Failed to authenticate');
-          }
-        }
-      });
-
-      ws.on('close', (code, reason) => {
-        log.warn(`Connection closed: ${code} - ${reason}`);
-      });
-
-      ws.on('error', (error) => {
-        log.error(`WebSocket error: ${error}`);
-      });
-
-    } catch (error) {
-      log.error(`Connection error: ${error}`);
-      retries += 1;
-      log.info(`Retrying in ${reconnectInterval / 1000} seconds...`);
-      await new Promise((resolve) => setTimeout(resolve, reconnectInterval));
-    }
+async function startPing(proxy) {
+  logger.info(`Starting ping loop for proxy: ${proxy}`);
+  try {
+    await ping(proxy);
+    setInterval(async () => {
+      await ping(proxy);
+    }, PING_INTERVAL);
+  } catch (error) {
+    logger.error(`Error in startPing for proxy ${proxy}: ${error.message}`);
   }
 }
 
-async function sendPing(ws, guid, options = {}) {
-  const payload = {
-    id: guid,
-    action: 'PING',
-    ...options,
-  };
-  ws.send(JSON.stringify(payload));
+async function ping(proxy) {
+  logger.info(`Sending ping to proxy: ${proxy}`);
+  let retries = 0;
+
+  try {
+    const data = {
+      id: accountInfo.uid,
+      browser_id: browserId,
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+
+    const response = await callApi(DOMAIN_API.PING, data, proxy);
+    if (response.code === 0) {
+      logger.info(`Ping successful via proxy ${proxy}`);
+      retries = 0;
+      statusConnect = CONNECTION_STATES.CONNECTED;
+    } else {
+      handlePingFail(proxy, response);
+    }
+  } catch (error) {
+    logger.error(`Ping failed via proxy ${proxy}: ${error.message}`);
+    handlePingFail(proxy, null);
+  }
 }
 
-async function sendPong(ws, guid) {
-  const payload = {
-    id: guid,
-    origin_action: 'PONG',
-  };
-  ws.send(JSON.stringify(payload));
+function handlePingFail(proxy, response) {
+  logger.warn(`Ping failure for proxy ${proxy}, response: ${JSON.stringify(response)}`);
+  
+  if (response && response.code === 403) {
+    handleLogout(proxy);
+  } else {
+    statusConnect = CONNECTION_STATES.DISCONNECTED;
+  }
+}
+
+function handleLogout(proxy) {
+  logger.info(`Logging out for proxy: ${proxy}`);
+  tokenInfo = null;
+  statusConnect = CONNECTION_STATES.NONE_CONNECTION;
+  accountInfo = {};
+  saveStatus(proxy, null);
+  logger.info(`Session info cleared for proxy: ${proxy}`);
+}
+
+function loadSessionInfo(proxy) {
+  logger.info(`Loading session info for proxy: ${proxy}`);
+  // Implement session loading logic here
+  return {};
+}
+
+function saveSessionInfo(proxy, data) {
+  logger.info(`Saving session info for proxy: ${proxy}, data: ${JSON.stringify(data)}`);
+  // Implement session saving logic here
+}
+
+function isValidProxy(proxy) {
+  // Validate proxy format or connection here
+  logger.info(`Validating proxy: ${proxy}`);
+  return true;
+}
+
+function removeProxyFromList(proxy) {
+  logger.info(`Removing proxy: ${proxy} from list`);
+  // Implement logic to remove proxy from the list
 }
 
 async function main() {
-  try {
-    const proxies = fs.readFileSync('proxy-list.txt', 'utf-8').split('\n').filter(Boolean);
+  logger.info("Starting main function");
 
-    if (proxies.length === 0) {
-      throw new Error('No proxies found in proxy-list.txt');
+  const allProxies = loadProxies('proxy.txt');
+  let activeProxies = allProxies.slice(0, 100).filter(isValidProxy);
+
+  const tasks = new Map();
+  for (const proxy of activeProxies) {
+    tasks.set(renderProfileInfo(proxy), proxy);
+  }
+
+  while (true) {
+    const [doneTask] = await Promise.race(tasks.keys());
+    const failedProxy = tasks.get(doneTask);
+
+    if ((await doneTask) === null) {
+      logger.info(`Removing and replacing failed proxy: ${failedProxy}`);
+      activeProxies = activeProxies.filter(p => p !== failedProxy);
+      const newProxy = allProxies.shift();
+      if (newProxy && isValidProxy(newProxy)) {
+        activeProxies.push(newProxy);
+        tasks.set(renderProfileInfo(newProxy), newProxy);
+      }
     }
+    tasks.delete(doneTask);
 
-    proxies.forEach((proxy) => {
-      connectSocketProxy(proxy, NP_TOKEN).catch((error) => log.error(`Error with proxy ${proxy}:`, error));
-    });
-
-  } catch (error) {
-    log.error('Error in main:', error);
+    await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds before next task
   }
 }
 
+function loadProxies(proxyFile) {
+  logger.info(`Loading proxies from file: ${proxyFile}`);
+  // Implement logic to load proxies from file
+  return [];
+}
+
 process.on('SIGINT', () => {
-  log.info('Process terminated');
-  process.exit(0);
+  logger.info("Program terminated by user.");
+  process.exit();
 });
 
 main();
